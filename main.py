@@ -16,7 +16,7 @@ from transformers import pipeline
 from typing import List, Dict
 import pytesseract
 from PIL import Image
-import fitz  # PyMuPDF
+import fitz
 import io
 
 st.set_page_config(page_title="Legal Document Analysis Chatbot", page_icon="⚖️", layout="wide")
@@ -83,17 +83,14 @@ def load_question_generator():
 def extract_text_with_ocr(pdf_path):
     """Extract text from PDF using OCR for scanned documents"""
     try:
-        # Open PDF with PyMuPDF
         pdf_document = fitz.open(pdf_path)
         documents = []
         
         for page_num in range(len(pdf_document)):
             page = pdf_document[page_num]
             
-            # First try to extract text normally
             text = page.get_text()
             
-            # If no text found or very little text, use OCR
             if len(text.strip()) < 50:
                 # Convert page to image
                 pix = page.get_pixmap()
@@ -127,9 +124,8 @@ def process_pdf(uploaded_file):
         loader = PyPDFLoader(tmp_file_path)
         pages = loader.load()
         
-        # Check if we got meaningful text
         total_text = "".join([page.page_content for page in pages])
-        if len(total_text.strip()) < 100:  # If very little text, try OCR
+        if len(total_text.strip()) < 100:
             st.info("Document appears to be scanned. Using OCR...")
             pages = extract_text_with_ocr(tmp_file_path)
     except Exception as e:
@@ -176,17 +172,17 @@ def analyze_document_structure(vectorstore):
 
 def show_gpu_info():
     if torch.cuda.is_available():
-        st.sidebar.success(f"🚀 GPU: {torch.cuda.get_device_name()}")
+        st.sidebar.success(f"GPU: {torch.cuda.get_device_name()}")
         st.sidebar.info(f"Memory: {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB")
     else:
-        st.sidebar.warning("🔋 Using CPU")
+        st.sidebar.warning("**Using CPU**")
 
 st.title("⚖️ Legal Document Analysis Chatbot")
 st.markdown("Upload a legal document (PDF) and ask questions about its terms or clauses.")
 
 with st.sidebar:
     show_gpu_info()
-    st.header("📄 Document Upload")
+    st.header("Document Upload")
     uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
     if uploaded_file and st.button("Process Document", type="primary"):
         with st.spinner("Processing..."):
@@ -195,12 +191,12 @@ with st.sidebar:
                 vectorstore, chunk_count = result
                 st.session_state.vectorstore = vectorstore
                 st.session_state.conversation_chain = create_conversation_chain(vectorstore)
-                st.success(f"✅ Processed {chunk_count} chunks.")
-                st.subheader("📋 Clause Analysis")
+                st.success(f" Processed {chunk_count} chunks.")
+                st.subheader(" Clause Analysis")
                 for clause, status in analyze_document_structure(vectorstore).items():
-                    st.write(f"{'✅' if status == 'Found' else '⚠️'} {clause.title()}: {status}")
+                    st.write(f"{'' if status == 'Found' else '⚠️'} {clause.title()}: {status}")
 
-st.header("❓ FAQs & Questions")
+st.header("FAQs & Questions")
 if st.session_state.vectorstore:
     summary = "".join([doc.page_content[:200] for doc in st.session_state.vectorstore.similarity_search("summary", k=3)])
     faq_questions = generate_legal_questions(summary, load_question_generator()) + [
@@ -209,9 +205,9 @@ if st.session_state.vectorstore:
     faq_selection = st.selectbox("Choose an FAQ:", ["Select an FAQ"] + faq_questions)
 
 if st.session_state.conversation_chain:
-    st.header("💬 Ask Questions")
+    st.header(" Ask Questions")
     if st.session_state.chat_history:
-        st.subheader("📜 Chat History")
+        st.subheader("Chat History")
         for i, (q, a) in enumerate(st.session_state.chat_history):
             with st.expander(f"Q{i+1}: {q[:50]}..."):
                 st.write(f"**Question:** {q}\n**Answer:** {a}")
@@ -230,7 +226,7 @@ if st.session_state.conversation_chain:
             try:
                 response = st.session_state.conversation_chain({"question": question})
                 st.session_state.chat_history.append((question, response["answer"]))
-                st.subheader("📝 Answer:")
+                st.subheader("Answer:")
                 st.write(response["answer"])
                 if response["source_documents"]:
                     with st.expander("📚 References"):
@@ -239,8 +235,8 @@ if st.session_state.conversation_chain:
             except Exception as e:
                 st.error(f"Error: {e}")
 else:
-    st.info("👆 Upload a PDF to start.")
-    st.subheader("📝 What You Can Do:")
+    st.info("Upload a PDF to start.")
+    st.subheader("What You Can Do:")
     st.markdown("- Upload contracts, NDAs, leases, or wills\n- Ask about clauses or terms\n- Use FAQs for common provisions\n- Get summaries or clause analysis")
 st.markdown("---")
 st.markdown("⚠️ **Disclaimer:** This tool is for informational purposes only. Consult a lawyer for legal advice.")
