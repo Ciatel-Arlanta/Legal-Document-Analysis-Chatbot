@@ -44,3 +44,26 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Usage
+
+1. Open the Streamlit app in your browser.
+2. Upload a legal PDF document (contract, NDA, lease, etc.).
+3. The system will:
+   - Extract text using PDF parser or OCR (if scanned)
+   - Embed the content using a legal-domain embedding model
+   - Store it in a vector store
+   - Allow you to ask legal questions about the content
+4. View generated answers and the document references used.
+
+## Example Questions
+
+- What are the confidentiality obligations?
+- Are there termination clauses?
+- What are the payment terms?
+- What is the governing law mentioned in this agreement?
+
+## Disclaimer
+
+This application is intended for **informational purposes only**.  
+It does **not** provide legal advice. For any legal matters, consult a qualified legal professional.
+
