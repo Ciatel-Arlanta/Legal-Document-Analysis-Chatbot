@@ -1,0 +1,12 @@
+streamlit>=1.30.0
+langchain>=0.1.15
+transformers>=4.38.0
+torch>=2.1.0
+pymupdf==1.23.7
+pytesseract>=0.3.10
+Pillow>=10.0.0
+chromadb>=0.4.22
+sentence-transformers>=2.2.2
+huggingface-hub>=0.20.3
+accelerate>=0.21.0
+tqdm
