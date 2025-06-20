@@ -60,7 +60,12 @@ Retrieve your external IP address using the wget command
 ```
 The `%%writefile app.py` writes the streamlit app code as a app.py file into the working space of colab.
 
-![image](https://github.com/user-attachments/assets/b5fb5bee-f826-4c32-bc62-ff81122c58e1)
+```python
+%%writefile app.py
+
+#Streamlit code
+print("Hello")
+```
 
 Install local tunnel to host the streamlit app
 ```bash
