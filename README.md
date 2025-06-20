@@ -44,6 +44,39 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+
+## How to run streamlit application on Google Colab
+
+Start by installing Streamlit in your Colab environment.
+
+```bash
+! pip install streamlit -q
+```
+
+Retrieve your external IP address using the wget command
+
+```bash
+!wget -q -O - ipv4.icanhazip.com
+```
+The `%%writefile app.py` writes the streamlit app code as a app.py file into the working space of colab.
+
+![image](https://github.com/user-attachments/assets/b5fb5bee-f826-4c32-bc62-ff81122c58e1)
+
+Install local tunnel to host the streamlit app
+```bash
+!npm install localtunnel
+```
+
+Run the streamlit app
+```bash
+!streamlit run /content/app.py &>/content/logs.txt &
+```
+
+As the streamlit app needs the port 8501 we will open that port using localtunnel
+```bash
+!npx localtunnel --port 8501
+```
+
 ## Usage
 
 1. Open the Streamlit app in your browser.
