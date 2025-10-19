@@ -1,7 +1,6 @@
 import streamlit as st
 import tempfile
 import os
-import torch
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -10,17 +9,30 @@ from langchain_community.llms import HuggingFacePipeline
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.prompts import PromptTemplate
-from langchain.schema.retriever import BaseRetriever
-from langchain.schema import Document
-from transformers import pipeline
-from typing import List, Dict
-import pytesseract
-from PIL import Image
-import fitz
-import io
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import pickle
+import re
+import nltk
+from nltk.tokenize import sent_tokenize
+from collections import Counter
 
-st.set_page_config(page_title="Legal Document Analysis Chatbot", page_icon="⚖️", layout="wide")
+# Download NLTK data for sentence tokenization
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 
+# Set page config
+st.set_page_config(
+    page_title="Legal Document Analysis Chatbot",
+    page_icon="⚖️",
+    layout="wide"
+)
+
+# Initialize session state
 if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
 if 'conversation_chain' not in st.session_state:
@@ -29,213 +41,441 @@ if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 
 class SimpleGPUVectorStore:
+    """Simple GPU-accelerated vector store using PyTorch"""
+    
     def __init__(self, embeddings_model):
         self.embeddings_model = embeddings_model
         self.documents = []
         self.embeddings = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+        
     def add_documents(self, documents):
+        """Add documents and compute embeddings"""
         self.documents = documents
         texts = [doc.page_content for doc in documents]
+        
+        # Get embeddings and move to GPU
         embeddings_list = self.embeddings_model.embed_documents(texts)
         self.embeddings = torch.tensor(embeddings_list, device=self.device, dtype=torch.float32)
-    
+        
     def similarity_search(self, query, k=5):
+        """Search for similar documents using GPU acceleration"""
         if self.embeddings is None:
             return []
+            
+        # Get query embedding and move to GPU
         query_embedding = self.embeddings_model.embed_query(query)
         query_tensor = torch.tensor(query_embedding, device=self.device, dtype=torch.float32).unsqueeze(0)
-        similarities = torch.cosine_similarity(query_tensor, self.embeddings)
+        
+        # Compute cosine similarity on GPU
+        similarities = torch.cosine_similarity(query_tensor, self.embeddings, dim=1)
+        
+        # Get top k results
         top_k_indices = torch.topk(similarities, min(k, len(self.documents))).indices
+        
         return [self.documents[i] for i in top_k_indices.cpu().numpy()]
     
     def as_retriever(self, search_kwargs=None):
+        """Return a retriever interface"""
         search_kwargs = search_kwargs or {"k": 5}
-        class Retriever(BaseRetriever):
-            vectorstore: SimpleGPUVectorStore
-            search_kwargs: dict
-            def _get_relevant_documents(self, query, *, run_manager=None):
+        
+        class Retriever:
+            def __init__(self, vectorstore, search_kwargs):
+                self.vectorstore = vectorstore
+                self.search_kwargs = search_kwargs
+                
+            def get_relevant_documents(self, query):
                 return self.vectorstore.similarity_search(query, **self.search_kwargs)
-            async def _aget_relevant_documents(self, query, *, run_manager=None):
-                return self.vectorstore.similarity_search(query, **self.search_kwargs)
-        return Retriever(vectorstore=self, search_kwargs=search_kwargs)
+        
+        return Retriever(self, search_kwargs)
 
 @st.cache_resource
 def load_embeddings():
+    """Load embeddings model - cached for efficiency"""
     try:
-        return HuggingFaceEmbeddings(model_name="neurolab/inlegalbert", model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'})
-    except:
-        st.warning("Failed to load InLegalBERT, using MiniLM.")
-        return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L12-v2", model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'})
+        # Use a model that works well with GPU
+        return HuggingFaceEmbeddings(
+            model_name="law-ai/InLegalBERT",
+            model_kwargs={'device': 'cuda' if torch.cuda.is_available() else 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}  # Normalize for better similarity
+        )
+    except Exception as e:
+        st.error(f"Error loading embeddings: {e}")
+        return HuggingFaceEmbeddings()
 
 @st.cache_resource
 def load_llm():
+    """Load LLM - cached for efficiency with better configuration"""
     try:
-        return HuggingFacePipeline(pipeline=pipeline("text2text-generation", model="google/flan-t5-large", max_length=512, do_sample=True, temperature=0.3, device=0 if torch.cuda.is_available() else -1))
-    except:
-        return HuggingFacePipeline(pipeline=pipeline("text2text-generation", model="google/flan-t5-base", max_length=512, do_sample=True, temperature=0.3, device=0 if torch.cuda.is_available() else -1))
-
-@st.cache_resource
-def load_question_generator():
-    return pipeline("text2text-generation", model="google/flan-t5-base", max_length=200, temperature=0.7)
-
-def extract_text_with_ocr(pdf_path):
-    """Extract text from PDF using OCR for scanned documents"""
-    try:
-        pdf_document = fitz.open(pdf_path)
-        documents = []
+        # Use accessible, lightweight model for legal analysis
+        model_name = "google/flan-t5-large"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
         
-        for page_num in range(len(pdf_document)):
-            page = pdf_document[page_num]
-            
-            text = page.get_text()
-            
-            if len(text.strip()) < 50:
-                # Convert page to image
-                pix = page.get_pixmap()
-                img_data = pix.tobytes("png")
-                image = Image.open(io.BytesIO(img_data))
-                
-                # Apply OCR
-                ocr_text = pytesseract.image_to_string(image, config='--psm 6')
-                text = ocr_text if len(ocr_text.strip()) > len(text.strip()) else text
-            
-            if text.strip():
-                doc = Document(
-                    page_content=text,
-                    metadata={"page": page_num + 1, "source": pdf_path}
-                )
-                documents.append(doc)
+        # Move model to GPU if available
+        if torch.cuda.is_available():
+            model = model.to("cuda")
         
-        pdf_document.close()
-        return documents
+        # Create pipeline with optimized parameters
+        qa_pipeline = pipeline(
+            "text2text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            max_length=512,  # Increased for more detailed answers
+            min_length=50,   # Ensure minimum length
+            do_sample=True,  # Enable sampling for more diverse outputs
+            temperature=0.3, # Slightly higher for creativity but still focused
+            top_p=0.9,
+            top_k=50,
+            repetition_penalty=1.2,  # Reduce repetition
+            device=0 if torch.cuda.is_available() else -1
+        )
+        return HuggingFacePipeline(pipeline=qa_pipeline)
     except Exception as e:
-        st.error(f"OCR extraction failed: {e}")
-        return []
+        st.error(f"Error loading LLM: {e}")
+        # Fallback to smaller model
+        qa_pipeline = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-base",
+            max_length=512,
+            min_length=50,
+            do_sample=True,
+            temperature=0.3,
+            top_p=0.9,
+            top_k=50,
+            repetition_penalty=1.2,
+            device=0 if torch.cuda.is_available() else -1
+        )
+        return HuggingFacePipeline(pipeline=qa_pipeline)
 
 def process_pdf(uploaded_file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_file_path = tmp_file.name
-    
+    """Process uploaded PDF and create vectorstore"""
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+
         loader = PyPDFLoader(tmp_file_path)
         pages = loader.load()
         
-        total_text = "".join([page.page_content for page in pages])
-        if len(total_text.strip()) < 100:
-            st.info("Document appears to be scanned. Using OCR...")
-            pages = extract_text_with_ocr(tmp_file_path)
-    except Exception as e:
-        st.warning(f"Regular PDF loading failed: {e}. Trying OCR...")
-        pages = extract_text_with_ocr(tmp_file_path)
-    
-    if not pages:
-        st.error("Failed to extract text from PDF")
+        # Enhanced text splitter with legal-specific separators
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,  # Slightly larger chunks for better context
+            chunk_overlap=200,  # More overlap to ensure continuity
+            length_function=len,
+            separators=["\n\n", "\n", ". ", "; ", ", ", " ", ""]
+        )
+        chunks = text_splitter.split_documents(pages)
+        
+        embeddings = load_embeddings()
+        
+        # Option 1: Use ChromaDB (simpler installation)
+        try:
+            vectorstore = Chroma.from_documents(chunks, embeddings)
+            st.info("Using ChromaDB as vector store")
+        except Exception as chroma_error:
+            # Option 2: Use custom GPU vector store
+            st.info("Using custom GPU-accelerated vector store")
+            vectorstore = SimpleGPUVectorStore(embeddings)
+            vectorstore.add_documents(chunks)
+        
         os.unlink(tmp_file_path)
-        return None, 0
+        return vectorstore, len(chunks)
     
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150, separators=["\n\n", "\n", ".", " ", ""])
-    chunks = text_splitter.split_documents(pages)
-    embeddings = load_embeddings()
-    try:
-        vectorstore = Chroma.from_documents(chunks, embeddings)
-    except:
-        vectorstore = SimpleGPUVectorStore(embeddings)
-        vectorstore.add_documents(chunks)
-    os.unlink(tmp_file_path)
-    return vectorstore, len(chunks)
+    except Exception as e:
+        st.error(f"Error processing PDF: {e}")
+        return None, 0
+
+def extract_key_points(text, max_points=5):
+    """Extract key points from text with improved parsing"""
+    # Clean up the text
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Use NLTK for better sentence tokenization
+    sentences = sent_tokenize(text)
+    
+    # Filter out very short sentences
+    sentences = [s for s in sentences if len(s) > 15]
+    
+    # If we have fewer sentences than max_points, return all
+    if len(sentences) <= max_points:
+        return sentences
+    
+    # Score sentences based on length and legal terms
+    legal_terms = [
+        "shall", "must", "agreement", "contract", "party", "obligation", 
+        "liability", "termination", "payment", "breach", "warranty", 
+        "indemnify", "governing law", "dispute", "confidential"
+    ]
+    
+    sentence_scores = []
+    for sentence in sentences:
+        # Base score from length (prefer medium-length sentences)
+        length_score = min(len(sentence.split()) / 20, 1.0)
+        
+        # Legal term score
+        legal_score = sum(1 for term in legal_terms if term.lower() in sentence.lower())
+        legal_score = min(legal_score / 3, 1.0)  # Normalize
+        
+        # Position score (earlier sentences might be more important)
+        position_score = 1.0 - (sentences.index(sentence) / len(sentences))
+        
+        # Combined score
+        total_score = 0.5 * length_score + 0.3 * legal_score + 0.2 * position_score
+        sentence_scores.append((sentence, total_score))
+    
+    # Sort by score and return top sentences
+    sentence_scores.sort(key=lambda x: x[1], reverse=True)
+    return [s[0] for s in sentence_scores[:max_points]]
 
 def create_conversation_chain(vectorstore):
+    """Create conversation chain with enhanced legal-specific prompt"""
     llm = load_llm()
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True, output_key="answer")
-    prompt_template = """You are a legal expert analyzing contracts, NDAs, leases, or wills. Provide accurate, concise answers citing specific clauses or sections. Avoid speculation and state if information is missing. Use a professional tone.
+    if llm is None:
+        return None
+    
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer"
+    )
+    
+    # Enhanced system prompt with legal expertise and structure
+    prompt_template = """You are a legal expert with deep knowledge of contract law and legal document analysis. 
 
-Context: {context}
-Chat History: {chat_history}
-Question: {question}
-Answer:"""
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "chat_history", "question"])
-    return ConversationalRetrievalChain.from_llm(llm=llm, retriever=vectorstore.as_retriever(search_kwargs={"k": 5}), memory=memory, return_source_documents=True, combine_docs_chain_kwargs={"prompt": prompt})
+Your task is to provide precise, accurate answers to questions about the legal document provided.
 
-def generate_legal_questions(summary: str, question_generator) -> List[str]:
-    prompt = f"Based on this legal document summary, generate 3 key questions about legal issues, parties, or terms:\nSummary: {summary}\nQuestions:"
-    result = question_generator(prompt, num_return_sequences=1)[0]['generated_text']
-    questions = [q.strip('- ').strip() for q in result.split('\n') if '?' in q and len(q.strip()) > 10]
-    return questions[:3] or ["What are the main obligations of the parties?", "What are the termination conditions?", "Is there a governing law clause?"]
+ANALYSIS GUIDELINES:
+1. Carefully analyze the context from the document
+2. Identify the specific legal concepts relevant to the question
+3. Provide a direct answer that addresses the question
+4. Support your answer with specific references to the document when possible
+5. Use clear, professional legal terminology
+6. Structure your answer with the most important information first
+
+CONTEXT FROM DOCUMENT:
+{context}
+
+CHAT HISTORY:
+{chat_history}
+
+QUESTION: {question}
+
+Provide a comprehensive, legally accurate answer to the question above:
+"""
+    
+    prompt = PromptTemplate(
+        template=prompt_template,
+        input_variables=["context", "chat_history", "question"]
+    )
+    
+    conversation_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),  # Increased for better context
+        memory=memory,
+        return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": prompt},
+        verbose=False
+    )
+    
+    return conversation_chain
 
 def analyze_document_structure(vectorstore):
-    clauses = ["payment", "termination", "indemnity", "governing law", "dispute resolution", "confidentiality", "liability", "assignment", "force majeure"]
-    return {clause: "Found" if any(clause.lower() in doc.page_content.lower() for doc in vectorstore.similarity_search(clause, k=3)) else "Not found" for clause in clauses}
+    """Analyze document for common legal clauses"""
+    if not vectorstore:
+        return {}
+    
+    common_clauses = [
+        "payment", "termination", "indemnity", "governing law",
+        "dispute resolution", "confidentiality", "liability",
+        "assignment", "force majeure", "obligations"
+    ]
+    
+    analysis = {}
+    for clause in common_clauses:
+        try:
+            docs = vectorstore.similarity_search(clause, k=3)
+            analysis[clause] = "Found" if any(clause.lower() in doc.page_content.lower() for doc in docs) else "Not clearly found"
+        except:
+            analysis[clause] = "Error checking"
+    
+    return analysis
 
+# Display GPU information
 def show_gpu_info():
+    """Display GPU information"""
     if torch.cuda.is_available():
-        st.sidebar.success(f"GPU: {torch.cuda.get_device_name()}")
-        st.sidebar.info(f"Memory: {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB")
+        st.sidebar.success(f"🚀 GPU Available: {torch.cuda.get_device_name()}")
+        st.sidebar.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB")
     else:
-        st.sidebar.warning("Using CPU")
+        st.sidebar.warning("🔋 Using CPU (No GPU detected)")
 
+# Streamlit UI
 st.title("⚖️ Legal Document Analysis Chatbot")
-st.markdown("Upload a legal document (PDF) and ask questions about its terms or clauses.")
+st.markdown("Upload any legal document (PDF) and ask questions about its terms, clauses, or obligations. Get precise, clause-specific answers.")
 
+# Sidebar for file upload and document analysis
 with st.sidebar:
     show_gpu_info()
-    st.header("Document Upload")
-    uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
-    if uploaded_file and st.button("Process Document", type="primary"):
-        with st.spinner("Processing..."):
-            result = process_pdf(uploaded_file)
-            if result[0] is not None:
-                vectorstore, chunk_count = result
-                st.session_state.vectorstore = vectorstore
-                st.session_state.conversation_chain = create_conversation_chain(vectorstore)
-                st.success(f"Processed {chunk_count} chunks.")
-                st.subheader("Clause Analysis")
-                for clause, status in analyze_document_structure(vectorstore).items():
-                    st.write(f"{'' if status == 'Found' else '⚠️'} {clause.title()}: {status}")
+    
+    st.header("📄 Document Upload")
+    uploaded_file = st.file_uploader(
+        "Upload a legal document (PDF)",
+        type="pdf",
+        help="Upload contracts, NDAs, leases, wills, or other legal documents"
+    )
+    
+    if uploaded_file is not None:
+        if st.button("Process Document", type="primary"):
+            with st.spinner("Processing legal document..."):
+                vectorstore, chunk_count = process_pdf(uploaded_file)
+                
+                if vectorstore:
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.conversation_chain = create_conversation_chain(vectorstore)
+                    st.success(f"✅ Document processed! Created {chunk_count} text chunks.")
+                    
+                    st.subheader("📋 Clause Analysis")
+                    analysis = analyze_document_structure(vectorstore)
+                    for clause, status in analysis.items():
+                        if status == "Found":
+                            st.success(f"✅ {clause.title()}: {status}")
+                        elif status == "Not clearly found":
+                            st.warning(f"⚠️ {clause.title()}: {status}")
+                        else:
+                            st.error(f"❌ {clause.title()}: {status}")
 
-st.header("FAQs & Questions")
-if st.session_state.vectorstore:
-    summary = "".join([doc.page_content[:200] for doc in st.session_state.vectorstore.similarity_search("summary", k=3)])
-    faq_questions = generate_legal_questions(summary, load_question_generator()) + [
-        "What are the payment obligations?", "What are the termination conditions?", "Is there a governing law clause?"
-    ]
-    faq_selection = st.selectbox("Choose an FAQ:", ["Select an FAQ"] + faq_questions)
+# FAQ Section
+st.header("❓ Frequently Asked Questions (FAQs)")
+st.markdown("Select an FAQ to quickly analyze common legal document terms.")
+faq_questions = [
+    "What are the payment obligations in the document?",
+    "What are the termination conditions?",
+    "What are the parties' main obligations?",
+    "Is there a governing law clause?",
+    "What are the dispute resolution terms?",
+    "Are there confidentiality provisions?",
+    "Can rights or obligations be assigned?",
+    "Is there a force majeure clause?",
+    "What are the indemnity provisions?"
+]
+faq_selection = st.selectbox("Choose an FAQ:", ["Select an FAQ"] + faq_questions)
 
-if st.session_state.conversation_chain:
-    st.header("Ask Questions")
+# Main chat interface
+if st.session_state.conversation_chain is not None:
+    st.header("💬 Ask Questions About Your Legal Document")
+    
     if st.session_state.chat_history:
-        st.subheader("Chat History")
-        for i, (q, a) in enumerate(st.session_state.chat_history):
-            with st.expander(f"Q{i+1}: {q[:50]}..."):
-                st.write(f"**Question:** {q}\n**Answer:** {a}")
-    user_question = st.text_input("Ask about the document:", placeholder="e.g., What are the confidentiality terms?")
+        st.markdown("### 📜 Conversation History")
+        for i, (question, answer) in enumerate(reversed(st.session_state.chat_history[-5:]), 1):  # Show last 5
+            with st.expander(f"💬 {question[:60]}{'...' if len(question) > 60 else ''}", expanded=False):
+                st.markdown(f"**Q:** {question}")
+                st.markdown(f"**A:** {answer}")
+                st.markdown("---")
+    
+    user_question = st.text_input(
+        "Ask a question about your document:",
+        placeholder="e.g., What are the termination conditions? Is there a confidentiality clause?"
+    )
+    
+    st.subheader("🔍 Quick Analysis Options")
     col1, col2, col3 = st.columns(3)
+    
     quick_question = None
     with col1:
-        if st.button("Summarize"): quick_question = "Summarize the document."
+        if st.button("Summarize Document"):
+            quick_question = "Provide a comprehensive summary of the legal document."
+    
     with col2:
-        if st.button("Key Terms"): quick_question = "What are the key terms?"
+        if st.button("Key Terms"):
+            quick_question = "What are the key terms and conditions in the document?"
+    
     with col3:
-        if st.button("Obligations"): quick_question = "What are the parties' obligations?"
-    question = faq_selection if faq_selection != "Select an FAQ" else quick_question or user_question
-    if question:
-        with st.spinner("Analyzing..."):
+        if st.button("Party Obligations"):
+            quick_question = "What are the main obligations of each party in the document?"
+    
+    question_to_process = faq_selection if faq_selection != "Select an FAQ" else quick_question if quick_question else user_question
+    
+    if question_to_process:
+        with st.spinner("Analyzing your question..."):
             try:
-                response = st.session_state.conversation_chain({"question": question})
-                st.session_state.chat_history.append((question, response["answer"]))
-                st.subheader("Answer:")
-                st.write(response["answer"])
-                if response["source_documents"]:
-                    with st.expander("📚 References"):
-                        for i, doc in enumerate(response["source_documents"][:3]):
-                            st.write(f"**Ref {i+1} (Page {doc.metadata.get('page', 'N/A')}):** {doc.page_content[:200]}...")
+                response = st.session_state.conversation_chain({"question": question_to_process})
+                answer = response["answer"]
+                
+                # Clean up the answer
+                answer = answer.strip()
+                
+                # Format the answer better
+                st.session_state.chat_history.append((question_to_process, answer))
+                
+                # Display answer in a nice card format
+                st.markdown("### 📝 Answer")
+                st.markdown(f"""
+                <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 5px solid #4CAF50;">
+                    <p style="font-size: 16px; line-height: 1.6; color: #333; margin: 0;">
+                        {answer}
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Show key points with improved parsing
+                st.markdown("#### 🔑 Key Points")
+                key_points = extract_key_points(answer, max_points=4)
+                
+                for i, point in enumerate(key_points, 1):
+                    # Highlight legal terms in the point
+                    highlighted_point = point
+                    legal_terms = ["shall", "must", "agreement", "contract", "party", "obligation", 
+                                  "liability", "termination", "payment", "breach", "warranty"]
+                    
+                    for term in legal_terms:
+                        if term.lower() in highlighted_point.lower():
+                            # Use regex to match whole words only
+                            pattern = r'\b(' + re.escape(term) + r')\b'
+                            highlighted_point = re.sub(
+                                pattern, 
+                                f'<strong style="color: #FF5722;">{term}</strong>', 
+                                highlighted_point, 
+                                flags=re.IGNORECASE
+                            )
+                    
+                    st.markdown(f"""
+                    <div style="background-color: black; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #2196F3;">
+                        <strong style="color: #2196F3;">Point {i}:</strong> {highlighted_point}
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Source references in a cleaner format
+                if "source_documents" in response and response["source_documents"]:
+                    with st.expander("📚 View Source References", expanded=False):
+                        for i, doc in enumerate(response["source_documents"][:3], 1):
+                            st.markdown(f"**Reference {i}** (Page {doc.metadata.get('page', 'N/A')})")
+                            st.text_area(
+                                label=f"Context {i}",
+                                value=doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content,
+                                height=100,
+                                disabled=True,
+                                key=f"source_{i}_{len(st.session_state.chat_history)}"
+                            )
+                            if i < len(response["source_documents"][:3]):
+                                st.markdown("---")
+                
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"❌ Error processing question: {e}")
+                st.info("Try rephrasing your question or ask something more specific.")
+
 else:
-    st.info("Upload a PDF to start.")
-    st.subheader("What You Can Do:")
-    st.markdown("- Upload contracts, NDAs, leases, or wills\n- Ask about clauses or terms\n- Use FAQs for common provisions\n- Get summaries or clause analysis")
+    st.info("👆 Please upload a legal document PDF using the sidebar to get started.")
+    
+    st.subheader("📝 What You Can Do:")
+    st.markdown("""
+    - **Upload** contracts, NDAs, leases, wills, or other legal documents
+    - **Ask about** specific clauses, terms, or obligations
+    - **Use FAQs** to explore common legal provisions
+    - **Get summaries** or detailed clause analysis
+    - **Understand** rights and obligations of parties
+    """)
+
+# Footer
 st.markdown("---")
-st.markdown("⚠️ **Disclaimer:** This tool is for informational purposes only. Consult a lawyer for legal advice.")
+st.markdown("⚠️ **Disclaimer:** This tool provides informational analysis of legal documents and is not a substitute for professional legal advice. Consult a qualified lawyer for legal guidance.")
