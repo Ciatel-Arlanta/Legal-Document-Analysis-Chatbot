@@ -100,6 +100,12 @@ As the streamlit app needs the port 8501 we will open that port using localtunne
 - What are the payment terms?
 - What is the governing law mentioned in this agreement?
 
+
+## Refernces/Citations
+law-ai/InLegalBERT - [Hugging face page](https://huggingface.co/law-ai/InLegalBERT)
+google/flan-t5-base - [Hugging face page](https://huggingface.co/google/flan-t5-base)
+Streamlit - [Website](https://streamlit.io/)
+
 ## Disclaimer
 
 This application is intended for **informational purposes only**.  
